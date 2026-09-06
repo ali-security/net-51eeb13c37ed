@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html/atom"
 )
 
 // https://github.com/golang/go/issues/58246
@@ -626,6 +628,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +945,109 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+// TestDuplicateAttributeSanitizerConfusion is a regression test for
+// CVE-2026-27136. Keeping duplicate attribute names in the token stream
+// misaligns the parse tree from what a browser builds (per WHATWG 13.2.5.33 a
+// browser keeps the first occurrence and drops the rest). A sanitizer that
+// collapses an element's attributes into a map before vetting them therefore
+// vets the last occurrence while the browser honours the first one, so
+// rendering the "sanitized" tree re-emits the attacker's value.
+func TestDuplicateAttributeSanitizerConfusion(t *testing.T) {
+	const evil = `javascript:alert(1)`
+	// The attacker puts the payload first, so a browser uses it, and a benign
+	// value second, so a map-building sanitizer only ever sees the benign one.
+	src := `<a href="` + evil + `" href="https://example.com/safe">click</a>`
+
+	doc, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	var sanitize func(*Node)
+	sanitize = func(n *Node) {
+		if n.Type == ElementNode {
+			// A typical sanitizer: collapse the attributes into a map (last
+			// occurrence wins) and drop the element's attributes when a
+			// disallowed value shows up.
+			attrs := map[string]string{}
+			for _, a := range n.Attr {
+				attrs[a.Key] = a.Val
+			}
+			if strings.HasPrefix(strings.ToLower(attrs["href"]), "javascript:") {
+				n.Attr = nil
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			sanitize(c)
+		}
+	}
+	sanitize(doc)
+
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := buf.String(); strings.Contains(got, evil) {
+		t.Errorf("sanitized render still contains %q: %s", evil, got)
+	}
+}
+
+// TestDuplicateAttributeParseRender checks that duplicate attribute names never
+// reach the parse tree, so that parsing and then rendering a document yields the
+// tree a browser would build. See CVE-2026-27136.
+func TestDuplicateAttributeParseRender(t *testing.T) {
+	testCases := []struct {
+		src  string
+		want string
+	}{
+		{`<div id="a" id="b"></div>`, `<div id="a"></div>`},
+		{`<div ID="a" id="b"></div>`, `<div id="a"></div>`},
+		{`<div id="a" iD="b" Id="c"></div>`, `<div id="a"></div>`},
+		{`<img src="a" onerror="alert(1)" src="b"/>`, `<img src="a" onerror="alert(1)"/>`},
+		// Non-ASCII case folding must not merge distinct attribute names.
+		{`<div ä="1" Ä="2"></div>`, `<div ä="1" Ä="2"></div>`},
+	}
+	for _, tc := range testCases {
+		nodes, err := ParseFragment(strings.NewReader(tc.src), &Node{
+			Type:     ElementNode,
+			Data:     "body",
+			DataAtom: atom.Body,
+		})
+		if err != nil {
+			t.Errorf("ParseFragment(%q): %v", tc.src, err)
+			continue
+		}
+		var buf bytes.Buffer
+		for _, n := range nodes {
+			if err := Render(&buf, n); err != nil {
+				t.Errorf("Render(%q): %v", tc.src, err)
+				continue
+			}
+		}
+		if got := buf.String(); got != tc.want {
+			t.Errorf("ParseFragment+Render(%q) = %q, want %q", tc.src, got, tc.want)
+		}
+	}
+}
