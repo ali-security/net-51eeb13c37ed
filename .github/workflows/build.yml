@@ -1,0 +1,92 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Go version
+        run: go version
+
+      # Produce the module zip FIRST, from a pristine copy of the tree, so no
+      # build byproduct can leak into it. The copy drops .git (never packaged)
+      # and .github (this workflow is ours; upstream ships no .github).
+      - name: Build module zip
+        run: |
+          set -eux
+          STAGE="${RUNNER_TEMP}/modsrc"
+          OUT="${RUNNER_TEMP}/build_output"
+          HELPER="${RUNNER_TEMP}/zipper"
+          mkdir -p "${STAGE}" "${OUT}" "${HELPER}"
+          tar -C "${GITHUB_WORKSPACE}" --exclude=./.git --exclude=./.github -cf - . | tar -C "${STAGE}" -xf -
+          {
+            echo 'package main'
+            echo 'import ('
+            echo '    "log"'
+            echo '    "os"'
+            echo '    "golang.org/x/mod/module"'
+            echo '    "golang.org/x/mod/zip"'
+            echo ')'
+            echo 'func main() {'
+            echo '    m := module.Version{Path: os.Args[1], Version: os.Args[2]}'
+            echo '    f, err := os.Create(os.Args[4])'
+            echo '    if err != nil { log.Fatal(err) }'
+            echo '    defer f.Close()'
+            echo '    if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil { log.Fatal(err) }'
+            echo '    log.Printf("created module zip: %s", os.Args[4])'
+            echo '}'
+          } > "${HELPER}/create_mod.go"
+          cd "${HELPER}"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 "${STAGE}" "${OUT}/v0.45.0.zip"
+          unzip -l "${OUT}/v0.45.0.zip" | head -40
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          set -eo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "${FILTER}" ]; then
+            go test -v -run "^($(echo "${FILTER}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${FILTER}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
